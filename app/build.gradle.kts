@@ -70,6 +70,16 @@ android {
   }
 }
 
+// Ensure .env and .env.example exist so Secrets Gradle Plugin never fails on clean checkouts
+val envExampleFile = rootProject.file(".env.example")
+if (!envExampleFile.exists()) {
+  envExampleFile.writeText("# Default secrets placeholder\n")
+}
+val envFile = rootProject.file(".env")
+if (!envFile.exists()) {
+  envFile.writeText("# Default secrets placeholder\n")
+}
+
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
 secrets {

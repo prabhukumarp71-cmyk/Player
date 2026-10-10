@@ -32,6 +32,15 @@ jobs:
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Setup Environment Files
+        run: |
+          if [ ! -f .env.example ]; then
+            echo "# Default secrets placeholder" > .env.example
+          fi
+          if [ ! -f .env ]; then
+            touch .env
+          fi
+
       - name: Grant Execute Permission to gradlew
         run: chmod +x gradlew
 
