@@ -1,0 +1,6 @@
+{
+  "name": "Player",
+  "description": "Foreground 4K/1080p/720p video recorder with optical Far Only mode and direct local storage playback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
