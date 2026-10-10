@@ -40,6 +40,17 @@ jobs:
           if [ ! -f .env ]; then
             touch .env
           fi
+          mkdir -p app/src/main/res/xml
+          if [ ! -f app/src/main/res/xml/backup_rules.xml ]; then
+            echo '<?xml version="1.0" encoding="utf-8"?><full-backup-content/>' > app/src/main/res/xml/backup_rules.xml
+          fi
+          if [ ! -f app/src/main/res/xml/data_extraction_rules.xml ]; then
+            echo '<?xml version="1.0" encoding="utf-8"?><data-extraction-rules><cloud-backup/><device-transfer/></data-extraction-rules>' > app/src/main/res/xml/data_extraction_rules.xml
+          fi
+          mkdir -p app/src/main/res/values
+          if [ ! -f app/src/main/res/values/themes.xml ]; then
+            echo '<?xml version="1.0" encoding="utf-8"?><resources><style name="Theme.MyApplication" parent="@android:style/Theme.Material.NoActionBar"/></resources>' > app/src/main/res/values/themes.xml
+          fi
 
       - name: Grant Execute Permission to gradlew
         run: chmod +x gradlew
