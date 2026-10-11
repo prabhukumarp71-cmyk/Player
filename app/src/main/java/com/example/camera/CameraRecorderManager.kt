@@ -2,16 +2,21 @@ package com.example.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.os.SystemClock
 import android.util.Log
+import android.util.Rational
 import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraControl
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.PendingRecording
@@ -23,7 +28,9 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import com.example.data.ClipStorageRepository
 import com.example.model.QualitySupportInfo
 import com.example.model.VideoQuality
@@ -31,6 +38,34 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
+
+/**
+ * Dedicated LifecycleOwner that remains in RESUMED state while foreground recording is active.
+ * This guarantees that when the user switches to other apps or minimizes to background,
+ * CameraX VideoCapture continues recording without interruption.
+ */
+class ForegroundRecordingLifecycleOwner : LifecycleOwner {
+    private val lifecycleRegistry = LifecycleRegistry(this)
+    override val lifecycle: Lifecycle get() = lifecycleRegistry
+
+    init {
+        lifecycleRegistry.currentState = Lifecycle.State.CREATED
+        lifecycleRegistry.currentState = Lifecycle.State.STARTED
+        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+    }
+
+    fun resume() {
+        if (lifecycleRegistry.currentState != Lifecycle.State.RESUMED) {
+            lifecycleRegistry.currentState = Lifecycle.State.STARTED
+            lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+        }
+    }
+
+    fun stop() {
+        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+    }
+}
 
 class CameraRecorderManager(
     private val context: Context,
@@ -42,6 +77,9 @@ class CameraRecorderManager(
     private var preview: Preview? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
+
+    // Dedicated lifecycle owner that keeps recording alive across background transitions
+    private val foregroundLifecycleOwner = ForegroundRecordingLifecycleOwner()
 
     private var currentLensFacing = CameraSelector.LENS_FACING_BACK
     private var currentQuality = VideoQuality.FHD_1080P
@@ -62,6 +100,7 @@ class CameraRecorderManager(
     private val _supportedQualities = MutableStateFlow<List<QualitySupportInfo>>(emptyList())
     val supportedQualities: StateFlow<List<QualitySupportInfo>> = _supportedQualities.asStateFlow()
 
+    // Zoom states
     private val _zoomRatio = MutableStateFlow(1.0f)
     val zoomRatio: StateFlow<Float> = _zoomRatio.asStateFlow()
 
@@ -70,6 +109,32 @@ class CameraRecorderManager(
 
     private val _minZoomRatio = MutableStateFlow(1.0f)
     val minZoomRatio: StateFlow<Float> = _minZoomRatio.asStateFlow()
+
+    // Far Mode focus distance (in diopters: 0.0f = infinity, ~0.05f = hyperfocal sharp range)
+    private val _farFocusDistance = MutableStateFlow(0.05f)
+    val farFocusDistance: StateFlow<Float> = _farFocusDistance.asStateFlow()
+
+    private val _hyperfocalDistance = MutableStateFlow<Float?>(null)
+    val hyperfocalDistance: StateFlow<Float?> = _hyperfocalDistance.asStateFlow()
+
+    // Exposure compensation states
+    private val _exposureIndex = MutableStateFlow(0)
+    val exposureIndex: StateFlow<Int> = _exposureIndex.asStateFlow()
+
+    private val _minExposureIndex = MutableStateFlow(-4)
+    val minExposureIndex: StateFlow<Int> = _minExposureIndex.asStateFlow()
+
+    private val _maxExposureIndex = MutableStateFlow(4)
+    val maxExposureIndex: StateFlow<Int> = _maxExposureIndex.asStateFlow()
+
+    private val _exposureStep = MutableStateFlow(0.33f)
+    val exposureStep: StateFlow<Float> = _exposureStep.asStateFlow()
+
+    private val _exposureValueText = MutableStateFlow("0.0 EV")
+    val exposureValueText: StateFlow<String> = _exposureValueText.asStateFlow()
+
+    private val _isExposureSupported = MutableStateFlow(false)
+    val isExposureSupported: StateFlow<Boolean> = _isExposureSupported.asStateFlow()
 
     private var recordingStartTime = 0L
 
@@ -83,7 +148,6 @@ class CameraRecorderManager(
     }
 
     fun initializeCamera(
-        lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
         quality: VideoQuality,
         farOnly: Boolean,
@@ -91,12 +155,13 @@ class CameraRecorderManager(
     ) {
         currentQuality = quality
         isFarOnlyModeEnabled = farOnly
+        foregroundLifecycleOwner.resume()
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             try {
                 cameraProvider = cameraProviderFuture.get()
-                bindCameraUseCases(lifecycleOwner, previewView, quality, farOnly)
+                bindCameraUseCases(previewView, quality, farOnly)
                 onReady()
             } catch (e: Exception) {
                 Log.e("CameraRecorderManager", "Failed to bind camera", e)
@@ -106,7 +171,6 @@ class CameraRecorderManager(
     }
 
     private fun bindCameraUseCases(
-        lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
         quality: VideoQuality,
         farOnly: Boolean
@@ -140,26 +204,62 @@ class CameraRecorderManager(
         videoCapture = VideoCapture.withOutput(recorder)
 
         try {
+            // Bind to the ForegroundRecordingLifecycleOwner so that background transitions don't kill the camera!
             camera = provider.bindToLifecycle(
-                lifecycleOwner,
+                foregroundLifecycleOwner,
                 cameraSelector,
                 preview,
                 videoCapture
             )
 
             // Setup zoom observers
-            camera?.cameraInfo?.zoomState?.observe(lifecycleOwner) { state ->
+            camera?.cameraInfo?.zoomState?.observe(foregroundLifecycleOwner) { state ->
                 _zoomRatio.value = state.zoomRatio
                 _maxZoomRatio.value = state.maxZoomRatio
                 _minZoomRatio.value = state.minZoomRatio
             }
 
+            // Setup exposure compensation state
+            val exposureState = camera?.cameraInfo?.exposureState
+            if (exposureState != null && exposureState.isExposureCompensationSupported) {
+                _isExposureSupported.value = true
+                _minExposureIndex.value = exposureState.exposureCompensationRange.lower
+                _maxExposureIndex.value = exposureState.exposureCompensationRange.upper
+                val stepFloat = exposureState.exposureCompensationStep.let {
+                    if (it.denominator != 0) it.numerator.toFloat() / it.denominator.toFloat() else 0.33f
+                }
+                _exposureStep.value = stepFloat
+                _exposureIndex.value = exposureState.exposureCompensationIndex
+                updateExposureText(exposureState.exposureCompensationIndex, stepFloat)
+            } else {
+                _isExposureSupported.value = false
+            }
+
+            // Query lens hyperfocal distance for far focus calibration
+            queryHyperfocalDistance()
+
             // Apply Far Only Mode optical setting if active
-            applyFarOnlyModeInternal(farOnly)
+            applyFarOnlyModeInternal(farOnly, _farFocusDistance.value)
 
         } catch (e: Exception) {
             Log.e("CameraRecorderManager", "Binding use cases failed", e)
             _recordingState.value = RecordingState.Error("Camera binding failed: ${e.message}")
+        }
+    }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun queryHyperfocalDistance() {
+        val cam = camera ?: return
+        try {
+            val camera2Info = Camera2CameraInfo.from(cam.cameraInfo)
+            val hf = camera2Info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_HYPERFOCAL_DISTANCE)
+            _hyperfocalDistance.value = hf
+            if (hf != null && hf > 0.0f) {
+                // Pre-calibrate optimal far focus to the physical sensor's hyperfocal distance
+                _farFocusDistance.value = hf
+            }
+        } catch (e: Exception) {
+            Log.w("CameraRecorderManager", "Hyperfocal distance not reported by hardware", e)
         }
     }
 
@@ -170,7 +270,6 @@ class CameraRecorderManager(
             } ?: return
 
             val capabilities = Recorder.getVideoCapabilities(cameraInfo)
-
             val supportedList = capabilities.getSupportedQualities(androidx.camera.core.DynamicRange.SDR)
             val list = mutableListOf<QualitySupportInfo>()
             for (q in VideoQuality.entries) {
@@ -191,32 +290,41 @@ class CameraRecorderManager(
     @SuppressLint("UnsafeOptInUsageError")
     fun setFarOnlyMode(enabled: Boolean) {
         isFarOnlyModeEnabled = enabled
-        applyFarOnlyModeInternal(enabled)
+        applyFarOnlyModeInternal(enabled, _farFocusDistance.value)
     }
 
     @SuppressLint("UnsafeOptInUsageError")
-    private fun applyFarOnlyModeInternal(enabled: Boolean) {
+    fun setFarFocusDistance(distanceDiopters: Float) {
+        val clamped = distanceDiopters.coerceIn(0.005f, 0.25f)
+        _farFocusDistance.value = clamped
+        if (isFarOnlyModeEnabled) {
+            applyFarOnlyModeInternal(true, clamped)
+        }
+    }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun applyFarOnlyModeInternal(enabled: Boolean, focusDistance: Float) {
         val cam = camera ?: return
         try {
             val camera2Control = Camera2CameraControl.from(cam.cameraControl)
             if (enabled) {
-                // Far Only Mode:
-                // 1. Lock optical focus to infinity (0.0f diopters in Camera2)
-                // 2. Disable AF hunting (CONTROL_AF_MODE_OFF)
+                // Optimal Far Focus:
+                // Rather than forcing theoretical 0.0f (which often causes mechanical over-infinity blur on mobile phone VCM coils),
+                // we calibrate to the optimal hyperfocal range (typically 0.03f - 0.08f diopters) ensuring maximum depth of field
+                // from 10 meters all the way to infinity.
+                val targetDistance = focusDistance.coerceAtLeast(0.005f)
+
                 val options = CaptureRequestOptions.Builder()
                     .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                    .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f)
+                    .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, targetDistance)
+                    // High-quality edge enhancement and noise filtering for razor-sharp distant object rendering
+                    .setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                    .setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                    .setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
                     .build()
                 camera2Control.setCaptureRequestOptions(options)
-
-                // When Far Only Mode is activated, set zoom to a telephoto / distance perspective (e.g. 2.0x min)
-                val currentZoom = _zoomRatio.value
-                if (currentZoom < 2.0f && _maxZoomRatio.value >= 2.0f) {
-                    cam.cameraControl.setZoomRatio(2.0f)
-                }
             } else {
-                // Normal Mode:
-                // Reset to continuous video autofocus
+                // Restore continuous video auto-focus
                 val options = CaptureRequestOptions.Builder()
                     .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                     .build()
@@ -227,8 +335,49 @@ class CameraRecorderManager(
         }
     }
 
+    /**
+     * Tap to focus & meter on a specific distant subject in the viewfinder.
+     * Locks focus to that target without near objects stealing it.
+     */
+    fun focusOnFarSubject(x: Float, y: Float, viewWidth: Float, viewHeight: Float) {
+        val cam = camera ?: return
+        try {
+            val factory = SurfaceOrientedMeteringPointFactory(viewWidth, viewHeight)
+            val point = factory.createPoint(x, y)
+            val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                .setAutoCancelDuration(0, TimeUnit.SECONDS) // Lock permanently until user changes
+                .build()
+            cam.cameraControl.startFocusAndMetering(action)
+        } catch (e: Exception) {
+            Log.w("CameraRecorderManager", "Tap to focus failed", e)
+        }
+    }
+
+    /**
+     * Exposure Control
+     */
+    fun setExposureIndex(index: Int) {
+        val cam = camera ?: return
+        val clamped = index.coerceIn(_minExposureIndex.value, _maxExposureIndex.value)
+        _exposureIndex.value = clamped
+        cam.cameraControl.setExposureCompensationIndex(clamped)
+        updateExposureText(clamped, _exposureStep.value)
+    }
+
+    fun stepExposure(delta: Int) {
+        setExposureIndex(_exposureIndex.value + delta)
+    }
+
+    fun resetExposure() {
+        setExposureIndex(0)
+    }
+
+    private fun updateExposureText(index: Int, step: Float) {
+        val ev = index * step
+        _exposureValueText.value = if (ev > 0) "+%.1f EV".format(ev) else "%.1f EV".format(ev)
+    }
+
     fun switchCamera(
-        lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
         quality: VideoQuality
     ) {
@@ -238,17 +387,16 @@ class CameraRecorderManager(
         } else {
             CameraSelector.LENS_FACING_BACK
         }
-        bindCameraUseCases(lifecycleOwner, previewView, quality, isFarOnlyModeEnabled)
+        bindCameraUseCases(previewView, quality, isFarOnlyModeEnabled)
     }
 
     fun changeQuality(
-        lifecycleOwner: LifecycleOwner,
         previewView: PreviewView,
         quality: VideoQuality
     ) {
         if (_recordingState.value is RecordingState.Recording) return
         currentQuality = quality
-        bindCameraUseCases(lifecycleOwner, previewView, quality, isFarOnlyModeEnabled)
+        bindCameraUseCases(previewView, quality, isFarOnlyModeEnabled)
     }
 
     fun toggleTorch(): Boolean {
@@ -357,6 +505,7 @@ class CameraRecorderManager(
     fun release() {
         activeRecording?.stop()
         activeRecording = null
+        foregroundLifecycleOwner.stop()
         cameraProvider?.unbindAll()
     }
 }

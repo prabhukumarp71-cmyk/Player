@@ -16,6 +16,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,8 +33,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AllInclusive
-import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.BrightnessMedium
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
@@ -42,18 +44,18 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,16 +63,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.camera.CameraRecorderManager
 import com.example.model.VideoQuality
 import com.example.ui.components.FarOnlyReticle
@@ -84,7 +88,6 @@ fun RecorderScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
 
     val recordingState by viewModel.recordingState.collectAsState()
     val recordingDuration by viewModel.recordingDurationSeconds.collectAsState()
@@ -99,8 +102,21 @@ fun RecorderScreen(
     val statusMessage by viewModel.statusMessage.collectAsState()
     val supportedQualities by viewModel.supportedQualities.collectAsState()
 
+    // Far mode distance & Exposure controls
+    val farFocusDistance by viewModel.farFocusDistance.collectAsState()
+    val exposureIndex by viewModel.exposureIndex.collectAsState()
+    val minExposureIndex by viewModel.minExposureIndex.collectAsState()
+    val maxExposureIndex by viewModel.maxExposureIndex.collectAsState()
+    val exposureValueText by viewModel.exposureValueText.collectAsState()
+    val isExposureSupported by viewModel.isExposureSupported.collectAsState()
+
     var showQualityDialog by remember { mutableStateOf(false) }
+    var showExposureControl by remember { mutableStateOf(false) }
     var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
+    var viewSize by remember { mutableStateOf(IntSize.Zero) }
+
+    // Tap to focus indicator position
+    var tapFocusPoint by remember { mutableStateOf<Offset?>(null) }
 
     val isRecording = recordingState is CameraRecorderManager.RecordingState.Recording
     val isPaused = recordingState is CameraRecorderManager.RecordingState.Paused
@@ -121,6 +137,22 @@ fun RecorderScreen(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
+            .onGloballyPositioned { coordinates ->
+                viewSize = coordinates.size
+            }
+            .pointerInput(Unit) {
+                detectTapGestures { offset ->
+                    tapFocusPoint = offset
+                    if (viewSize.width > 0 && viewSize.height > 0) {
+                        viewModel.focusOnFarSubject(
+                            x = offset.x,
+                            y = offset.y,
+                            width = viewSize.width.toFloat(),
+                            height = viewSize.height.toFloat()
+                        )
+                    }
+                }
+            }
             .testTag("recorder_screen")
     ) {
         // Camera Viewfinder
@@ -136,7 +168,6 @@ fun RecorderScreen(
                     implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                     previewViewRef = this
                     viewModel.cameraManager.initializeCamera(
-                        lifecycleOwner = lifecycleOwner,
                         previewView = this,
                         quality = selectedQuality,
                         farOnly = isFarOnlyMode
@@ -145,10 +176,28 @@ fun RecorderScreen(
             }
         )
 
-        // Far-Only Mode Reticle Overlay
+        // Far-Only Mode Reticle Overlay with interactive distance presets
         if (isFarOnlyMode) {
             FarOnlyReticle(
+                currentFocusDistance = farFocusDistance,
+                onDistanceSelected = { distance ->
+                    viewModel.setFarFocusDistance(distance)
+                },
                 modifier = Modifier.fillMaxSize()
+            )
+        }
+
+        // Tap to focus target indicator
+        tapFocusPoint?.let { pos ->
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(
+                        start = (pos.x / (LocalContext.current.resources.displayMetrics.density) - 24).coerceAtLeast(0f).dp,
+                        top = (pos.y / (LocalContext.current.resources.displayMetrics.density) - 24).coerceAtLeast(0f).dp
+                    )
+                    .size(48.dp)
+                    .border(1.5.dp, if (isFarOnlyMode) Color(0xFF00E5FF) else Color(0xFFFACC15), CircleShape)
             )
         }
 
@@ -165,7 +214,7 @@ fun RecorderScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                // App Branding: Player (Clean, no logo image)
+                // App Branding: Player
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
@@ -207,7 +256,7 @@ fun RecorderScreen(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Quick Toolbar: Resolution Selector, Far Only Toggle, Flash, Mic
+            // Quick Toolbar: Resolution, Far Only, Exposure EV, Flash, Mic
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -224,27 +273,20 @@ fun RecorderScreen(
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Tune,
                             contentDescription = "Quality Settings",
                             tint = Color(0xFF38BDF8),
-                            modifier = Modifier.size(15.dp)
+                            modifier = Modifier.size(14.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(5.dp))
                         Text(
                             text = selectedQuality.label,
                             color = Color.White,
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = selectedQuality.resolutionLabel,
-                            color = Color(0xFF38BDF8),
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace
                         )
                     }
                 }
@@ -263,19 +305,52 @@ fun RecorderScreen(
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.AllInclusive,
                             contentDescription = "Far Only Mode",
                             tint = if (isFarOnlyMode) Color(0xFF00E5FF) else Color(0xFF94A3B8),
-                            modifier = Modifier.size(15.dp)
+                            modifier = Modifier.size(14.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(5.dp))
                         Text(
-                            text = if (isFarOnlyMode) "FAR ONLY: ON" else "FAR ONLY",
+                            text = if (isFarOnlyMode) "FAR: ON" else "FAR ONLY",
                             color = if (isFarOnlyMode) Color(0xFF00E5FF) else Color(0xFFE2E8F0),
                             fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                // Exposure Control Toggle Button
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = if (showExposureControl) Color(0xDD3B2E05) else Color(0xAA181B26),
+                    border = androidx.compose.foundation.BorderStroke(
+                        width = 1.dp,
+                        color = if (showExposureControl) Color(0xFFFACC15) else Color(0x44FFFFFF)
+                    ),
+                    modifier = Modifier
+                        .clickable { showExposureControl = !showExposureControl }
+                        .testTag("exposure_control_chip")
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.BrightnessMedium,
+                            contentDescription = "Exposure Compensation",
+                            tint = if (showExposureControl) Color(0xFFFACC15) else Color(0xFFE2E8F0),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = exposureValueText,
+                            color = if (showExposureControl) Color(0xFFFACC15) else Color.White,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -286,7 +361,7 @@ fun RecorderScreen(
                 // Mic toggle
                 Box(
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(34.dp)
                         .background(Color(0x99181B26), CircleShape)
                         .clickable { viewModel.toggleAudio() },
                     contentAlignment = Alignment.Center
@@ -295,14 +370,14 @@ fun RecorderScreen(
                         imageVector = if (isAudioEnabled) Icons.Default.Mic else Icons.Default.MicOff,
                         contentDescription = "Audio Toggle",
                         tint = if (isAudioEnabled) Color(0xFFE2E8F0) else Color(0xFFEF4444),
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
 
                 // Torch toggle
                 Box(
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(34.dp)
                         .background(Color(0x99181B26), CircleShape)
                         .clickable { viewModel.toggleTorch() },
                     contentAlignment = Alignment.Center
@@ -311,18 +386,112 @@ fun RecorderScreen(
                         imageVector = if (isTorchOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
                         contentDescription = "Torch Toggle",
                         tint = if (isTorchOn) Color(0xFFFACC15) else Color(0xFFE2E8F0),
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
+                }
+            }
+
+            // Expandable Exposure Adjustment Slider & Stepper
+            AnimatedVisibility(
+                visible = showExposureControl,
+                enter = fadeIn() + slideInVertically(),
+                exit = fadeOut() + slideOutVertically()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp)
+                        .background(Color(0xDD121520), RoundedCornerShape(16.dp))
+                        .border(1.dp, Color(0xFFFACC15).copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.BrightnessMedium,
+                                contentDescription = "Exposure",
+                                tint = Color(0xFFFACC15),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Exposure Compensation",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = exposureValueText,
+                                color = Color(0xFFFACC15),
+                                fontSize = 13.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "RESET",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .background(Color(0xFF202636), RoundedCornerShape(6.dp))
+                                    .clickable { viewModel.resetExposure() }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(
+                            onClick = { viewModel.stepExposure(-1) },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Default.Remove, "Decrease Exposure", tint = Color.White, modifier = Modifier.size(18.dp))
+                        }
+
+                        Slider(
+                            value = exposureIndex.toFloat(),
+                            onValueChange = { newVal ->
+                                viewModel.setExposureIndex(newVal.toInt())
+                            },
+                            valueRange = minExposureIndex.toFloat()..maxExposureIndex.toFloat(),
+                            steps = (maxExposureIndex - minExposureIndex - 1).coerceAtLeast(0),
+                            modifier = Modifier.weight(1f),
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color(0xFFFACC15),
+                                activeTrackColor = Color(0xFFFACC15),
+                                inactiveTrackColor = Color(0xFF333A4D)
+                            )
+                        )
+
+                        IconButton(
+                            onClick = { viewModel.stepExposure(1) },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Default.Add, "Increase Exposure", tint = Color.White, modifier = Modifier.size(18.dp))
+                        }
+                    }
                 }
             }
         }
 
-        // Active Recording HUD Center Overlay
+        // Active Recording HUD Center Overlay + Background Recording Assurance
         if (isRecording || isPaused) {
             Column(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 110.dp),
+                    .padding(top = 114.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Surface(
@@ -369,6 +538,24 @@ fun RecorderScreen(
                             fontWeight = FontWeight.SemiBold
                         )
                     }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                // Background Recording Indicator
+                Box(
+                    modifier = Modifier
+                        .background(Color(0xBB082015), RoundedCornerShape(12.dp))
+                        .border(1.dp, Color(0xFF10B981).copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                        .padding(horizontal = 10.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = "FOREGROUND SERVICE ACTIVE • RECORDS IN BACKGROUND",
+                        color = Color(0xFF10B981),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
                 }
             }
         }
@@ -533,7 +720,7 @@ fun RecorderScreen(
                         .border(1.dp, Color(0xFF333846), RoundedCornerShape(16.dp))
                         .clickable(enabled = !isRecording) {
                             previewViewRef?.let { pv ->
-                                viewModel.switchCamera(lifecycleOwner, pv)
+                                viewModel.switchCamera(pv)
                             }
                         }
                         .testTag("switch_camera_button"),
@@ -599,7 +786,7 @@ fun RecorderScreen(
                 supportedQualities = supportedQualities,
                 onSelectQuality = { q ->
                     previewViewRef?.let { pv ->
-                        viewModel.selectQuality(q, lifecycleOwner, pv)
+                        viewModel.selectQuality(q, pv)
                     }
                 },
                 onDismiss = { showQualityDialog = false }

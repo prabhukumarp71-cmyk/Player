@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.Context
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
 import com.example.camera.CameraRecorderManager
 import com.example.data.ClipStorageRepository
@@ -60,10 +59,11 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private val _statusMessage = MutableStateFlow<String?>(null)
     val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
 
-    // Recently saved clip preview (popup chip)
+    // Recently saved clip preview
     private val _lastSavedClip = MutableStateFlow<RecordedClip?>(null)
     val lastSavedClip: StateFlow<RecordedClip?> = _lastSavedClip.asStateFlow()
 
+    // Camera stats & controls
     val recordingState = cameraManager.recordingState
     val recordingDurationSeconds = cameraManager.recordingDurationSeconds
     val recordingBytes = cameraManager.recordingBytes
@@ -71,6 +71,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     val zoomRatio = cameraManager.zoomRatio
     val maxZoomRatio = cameraManager.maxZoomRatio
     val minZoomRatio = cameraManager.minZoomRatio
+
+    // Far mode & exposure states
+    val farFocusDistance = cameraManager.farFocusDistance
+    val exposureIndex = cameraManager.exposureIndex
+    val minExposureIndex = cameraManager.minExposureIndex
+    val maxExposureIndex = cameraManager.maxExposureIndex
+    val exposureValueText = cameraManager.exposureValueText
+    val isExposureSupported = cameraManager.isExposureSupported
 
     init {
         refreshStorageInfo()
@@ -81,20 +89,41 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         _currentScreen.value = screen
     }
 
-    fun selectQuality(quality: VideoQuality, lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+    fun selectQuality(quality: VideoQuality, previewView: PreviewView) {
         _selectedQuality.value = quality
-        cameraManager.changeQuality(lifecycleOwner, previewView, quality)
+        cameraManager.changeQuality(previewView, quality)
     }
 
     fun toggleFarOnlyMode(enabled: Boolean) {
         _isFarOnlyMode.value = enabled
         cameraManager.setFarOnlyMode(enabled)
         val msg = if (enabled) {
-            "Far Only Mode Engaged: Optical Infinity Focus locked (0.0D). Near objects blurred."
+            "Far Only Mode Engaged: Hyperfocal focus active. Distant objects sharp; foreground blurred."
         } else {
             "Far Only Mode Disengaged: Standard continuous auto-focus restored."
         }
         _statusMessage.value = msg
+    }
+
+    fun setFarFocusDistance(distance: Float) {
+        cameraManager.setFarFocusDistance(distance)
+    }
+
+    fun focusOnFarSubject(x: Float, y: Float, width: Float, height: Float) {
+        cameraManager.focusOnFarSubject(x, y, width, height)
+        _statusMessage.value = "Locked focus to distant target"
+    }
+
+    fun setExposureIndex(index: Int) {
+        cameraManager.setExposureIndex(index)
+    }
+
+    fun stepExposure(delta: Int) {
+        cameraManager.stepExposure(delta)
+    }
+
+    fun resetExposure() {
+        cameraManager.resetExposure()
     }
 
     fun toggleTorch() {
@@ -112,8 +141,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         cameraManager.setZoom(ratio)
     }
 
-    fun switchCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
-        cameraManager.switchCamera(lifecycleOwner, previewView, _selectedQuality.value)
+    fun switchCamera(previewView: PreviewView) {
+        cameraManager.switchCamera(previewView, _selectedQuality.value)
     }
 
     fun startRecording(context: Context) {
