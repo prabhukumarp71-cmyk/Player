@@ -25,7 +25,7 @@ sealed class ScreenDestination {
 class PlayerViewModel(application: Application) : AndroidViewModel(application) {
 
     val storageRepository = ClipStorageRepository(application)
-    val cameraManager = CameraRecorderManager(application, storageRepository)
+    val cameraManager = CameraRecorderManager.getInstance(application)
 
     // Current navigation tab
     private val _currentScreen = MutableStateFlow<ScreenDestination>(ScreenDestination.Recorder)
@@ -215,6 +215,6 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     override fun onCleared() {
         super.onCleared()
-        cameraManager.release()
+        cameraManager.detachPreview()
     }
 }

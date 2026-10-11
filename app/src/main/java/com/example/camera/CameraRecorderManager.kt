@@ -6,13 +6,10 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.os.SystemClock
 import android.util.Log
-import android.util.Rational
 import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
-import androidx.camera.core.CameraControl
-import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
@@ -77,6 +74,7 @@ class CameraRecorderManager(
     private var preview: Preview? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
+    private var currentPreviewView: PreviewView? = null
 
     // Dedicated lifecycle owner that keeps recording alive across background transitions
     private val foregroundLifecycleOwner = ForegroundRecordingLifecycleOwner()
@@ -110,7 +108,7 @@ class CameraRecorderManager(
     private val _minZoomRatio = MutableStateFlow(1.0f)
     val minZoomRatio: StateFlow<Float> = _minZoomRatio.asStateFlow()
 
-    // Far Mode focus distance (in diopters: 0.0f = infinity, ~0.05f = hyperfocal sharp range)
+    // Far Mode focus distance (in diopters: ~0.05f = hyperfocal sharp range)
     private val _farFocusDistance = MutableStateFlow(0.05f)
     val farFocusDistance: StateFlow<Float> = _farFocusDistance.asStateFlow()
 
@@ -148,11 +146,12 @@ class CameraRecorderManager(
     }
 
     fun initializeCamera(
-        previewView: PreviewView,
+        previewView: PreviewView?,
         quality: VideoQuality,
         farOnly: Boolean,
         onReady: () -> Unit = {}
     ) {
+        currentPreviewView = previewView
         currentQuality = quality
         isFarOnlyModeEnabled = farOnly
         foregroundLifecycleOwner.resume()
@@ -161,7 +160,7 @@ class CameraRecorderManager(
         cameraProviderFuture.addListener({
             try {
                 cameraProvider = cameraProviderFuture.get()
-                bindCameraUseCases(previewView, quality, farOnly)
+                bindCameraUseCases(withPreview = previewView != null)
                 onReady()
             } catch (e: Exception) {
                 Log.e("CameraRecorderManager", "Failed to bind camera", e)
@@ -170,47 +169,72 @@ class CameraRecorderManager(
         }, executor)
     }
 
-    private fun bindCameraUseCases(
-        previewView: PreviewView,
-        quality: VideoQuality,
-        farOnly: Boolean
-    ) {
+    private fun bindCameraUseCases(withPreview: Boolean) {
         val provider = cameraProvider ?: return
-        provider.unbindAll()
+
+        // If recording is actively in progress, do not unbind videoCapture!
+        if (activeRecording == null) {
+            provider.unbindAll()
+        } else {
+            preview?.let { provider.unbind(it) }
+        }
 
         val cameraSelector = CameraSelector.Builder()
             .requireLensFacing(currentLensFacing)
             .build()
 
-        // Setup Preview
-        preview = Preview.Builder().build().also {
-            it.surfaceProvider = previewView.surfaceProvider
+        // Setup Preview if requested and surface is available
+        if (withPreview && currentPreviewView != null) {
+            preview = Preview.Builder().build().also {
+                it.surfaceProvider = currentPreviewView!!.surfaceProvider
+            }
+        } else {
+            preview = null
         }
 
         // Query real supported qualities for selected lens
         checkSupportedQualities(provider, cameraSelector)
 
-        // Build real Recorder with QualitySelector
-        val qualitySelector = QualitySelector.from(
-            quality.cameraXQuality,
-            FallbackStrategy.lowerQualityOrHigherThan(quality.cameraXQuality)
-        )
+        // Build VideoCapture only if not already built or not recording
+        if (videoCapture == null || activeRecording == null) {
+            val qualitySelector = QualitySelector.from(
+                currentQuality.cameraXQuality,
+                FallbackStrategy.lowerQualityOrHigherThan(currentQuality.cameraXQuality)
+            )
 
-        val recorder = Recorder.Builder()
-            .setQualitySelector(qualitySelector)
-            .setExecutor(executor)
-            .build()
+            val recorder = Recorder.Builder()
+                .setQualitySelector(qualitySelector)
+                .setExecutor(executor)
+                .build()
 
-        videoCapture = VideoCapture.withOutput(recorder)
+            videoCapture = VideoCapture.withOutput(recorder)
+        }
 
         try {
-            // Bind to the ForegroundRecordingLifecycleOwner so that background transitions don't kill the camera!
-            camera = provider.bindToLifecycle(
-                foregroundLifecycleOwner,
-                cameraSelector,
-                preview,
-                videoCapture
-            )
+            if (activeRecording == null) {
+                // Initial bind with both videoCapture and optional preview
+                camera = if (preview != null) {
+                    provider.bindToLifecycle(
+                        foregroundLifecycleOwner,
+                        cameraSelector,
+                        preview,
+                        videoCapture
+                    )
+                } else {
+                    provider.bindToLifecycle(
+                        foregroundLifecycleOwner,
+                        cameraSelector,
+                        videoCapture
+                    )
+                }
+            } else if (preview != null) {
+                // Recording is ongoing in background, re-attach preview surface seamlessly
+                camera = provider.bindToLifecycle(
+                    foregroundLifecycleOwner,
+                    cameraSelector,
+                    preview
+                )
+            }
 
             // Setup zoom observers
             camera?.cameraInfo?.zoomState?.observe(foregroundLifecycleOwner) { state ->
@@ -239,11 +263,31 @@ class CameraRecorderManager(
             queryHyperfocalDistance()
 
             // Apply Far Only Mode optical setting if active
-            applyFarOnlyModeInternal(farOnly, _farFocusDistance.value)
+            applyFarOnlyModeInternal(isFarOnlyModeEnabled, _farFocusDistance.value)
 
         } catch (e: Exception) {
             Log.e("CameraRecorderManager", "Binding use cases failed", e)
             _recordingState.value = RecordingState.Error("Camera binding failed: ${e.message}")
+        }
+    }
+
+    fun attachPreview(previewView: PreviewView) {
+        currentPreviewView = previewView
+        if (cameraProvider != null) {
+            bindCameraUseCases(withPreview = true)
+        }
+    }
+
+    fun detachPreview() {
+        currentPreviewView = null
+        val provider = cameraProvider ?: return
+        try {
+            preview?.let {
+                provider.unbind(it)
+                preview = null
+            }
+        } catch (e: Exception) {
+            Log.w("CameraRecorderManager", "Detaching preview failed", e)
         }
     }
 
@@ -255,7 +299,6 @@ class CameraRecorderManager(
             val hf = camera2Info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_HYPERFOCAL_DISTANCE)
             _hyperfocalDistance.value = hf
             if (hf != null && hf > 0.0f) {
-                // Pre-calibrate optimal far focus to the physical sensor's hyperfocal distance
                 _farFocusDistance.value = hf
             }
         } catch (e: Exception) {
@@ -308,23 +351,17 @@ class CameraRecorderManager(
         try {
             val camera2Control = Camera2CameraControl.from(cam.cameraControl)
             if (enabled) {
-                // Optimal Far Focus:
-                // Rather than forcing theoretical 0.0f (which often causes mechanical over-infinity blur on mobile phone VCM coils),
-                // we calibrate to the optimal hyperfocal range (typically 0.03f - 0.08f diopters) ensuring maximum depth of field
-                // from 10 meters all the way to infinity.
                 val targetDistance = focusDistance.coerceAtLeast(0.005f)
 
                 val options = CaptureRequestOptions.Builder()
                     .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
                     .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, targetDistance)
-                    // High-quality edge enhancement and noise filtering for razor-sharp distant object rendering
                     .setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
                     .setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
                     .setCaptureRequestOption(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
                     .build()
                 camera2Control.setCaptureRequestOptions(options)
             } else {
-                // Restore continuous video auto-focus
                 val options = CaptureRequestOptions.Builder()
                     .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
                     .build()
@@ -335,17 +372,13 @@ class CameraRecorderManager(
         }
     }
 
-    /**
-     * Tap to focus & meter on a specific distant subject in the viewfinder.
-     * Locks focus to that target without near objects stealing it.
-     */
     fun focusOnFarSubject(x: Float, y: Float, viewWidth: Float, viewHeight: Float) {
         val cam = camera ?: return
         try {
             val factory = SurfaceOrientedMeteringPointFactory(viewWidth, viewHeight)
             val point = factory.createPoint(x, y)
             val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-                .setAutoCancelDuration(0, TimeUnit.SECONDS) // Lock permanently until user changes
+                .setAutoCancelDuration(0, TimeUnit.SECONDS)
                 .build()
             cam.cameraControl.startFocusAndMetering(action)
         } catch (e: Exception) {
@@ -353,9 +386,6 @@ class CameraRecorderManager(
         }
     }
 
-    /**
-     * Exposure Control
-     */
     fun setExposureIndex(index: Int) {
         val cam = camera ?: return
         val clamped = index.coerceIn(_minExposureIndex.value, _maxExposureIndex.value)
@@ -378,7 +408,7 @@ class CameraRecorderManager(
     }
 
     fun switchCamera(
-        previewView: PreviewView,
+        previewView: PreviewView?,
         quality: VideoQuality
     ) {
         if (_recordingState.value is RecordingState.Recording) return
@@ -387,16 +417,18 @@ class CameraRecorderManager(
         } else {
             CameraSelector.LENS_FACING_BACK
         }
-        bindCameraUseCases(previewView, quality, isFarOnlyModeEnabled)
+        currentPreviewView = previewView
+        bindCameraUseCases(withPreview = previewView != null)
     }
 
     fun changeQuality(
-        previewView: PreviewView,
+        previewView: PreviewView?,
         quality: VideoQuality
     ) {
         if (_recordingState.value is RecordingState.Recording) return
         currentQuality = quality
-        bindCameraUseCases(previewView, quality, isFarOnlyModeEnabled)
+        currentPreviewView = previewView
+        bindCameraUseCases(withPreview = previewView != null)
     }
 
     fun toggleTorch(): Boolean {
@@ -503,9 +535,23 @@ class CameraRecorderManager(
     }
 
     fun release() {
-        activeRecording?.stop()
-        activeRecording = null
-        foregroundLifecycleOwner.stop()
-        cameraProvider?.unbindAll()
+        if (activeRecording == null) {
+            foregroundLifecycleOwner.stop()
+            cameraProvider?.unbindAll()
+        }
+    }
+
+    companion object {
+        @Volatile
+        private var INSTANCE: CameraRecorderManager? = null
+
+        fun getInstance(context: Context): CameraRecorderManager {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: CameraRecorderManager(
+                    context.applicationContext,
+                    ClipStorageRepository(context.applicationContext)
+                ).also { INSTANCE = it }
+            }
+        }
     }
 }

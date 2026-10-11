@@ -1,5 +1,6 @@
 package com.example.service
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,18 +11,25 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
+import com.example.camera.CameraRecorderManager
 
 class PlayerRecordingService : Service() {
 
     private var isNotificationDismissedByUser = false
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Player:BackgroundRecordingWakeLock")
+        } catch (_: Exception) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -43,6 +51,7 @@ class PlayerRecordingService : Service() {
         }
 
         if (action == ACTION_STOP_SERVICE) {
+            CameraRecorderManager.getInstance(this).stopRecording()
             stopForegroundService()
             return START_NOT_STICKY
         }
@@ -52,6 +61,13 @@ class PlayerRecordingService : Service() {
 
         isNotificationDismissedByUser = false
         val notification = buildRecordingNotification(quality, isFarOnly)
+
+        // Acquire WakeLock to keep CPU alive in background and while screen is off
+        try {
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(3 * 60 * 60 * 1000L /* 3 hours max */)
+            }
+        } catch (_: Exception) {}
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val serviceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -65,6 +81,12 @@ class PlayerRecordingService : Service() {
         }
 
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // When the app is swiped away from Recents / closed, do NOT stop recording!
+        // The foreground service continues recording in background until explicitly stopped.
     }
 
     private fun buildRecordingNotification(quality: String, isFarOnly: Boolean): Notification {
@@ -88,8 +110,18 @@ class PlayerRecordingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val stopIntent = Intent(this, PlayerRecordingService::class.java).apply {
+            action = ACTION_STOP_SERVICE
+        }
+        val pendingStop = PendingIntent.getService(
+            this,
+            2,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val modeLabel = if (isFarOnly) " [Far Only Mode]" else ""
-        val content = "Recording in foreground • $quality$modeLabel (Swipe to dismiss)"
+        val content = "Recording in background • $quality$modeLabel"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Player - Video Recording Active")
@@ -99,12 +131,19 @@ class PlayerRecordingService : Service() {
             .setAutoCancel(true) // Automatically clears on interaction
             .setContentIntent(pendingLaunch)
             .setDeleteIntent(pendingDismiss) // Triggered when swiped away
+            .addAction(android.R.drawable.ic_media_pause, "Stop Recording", pendingStop)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 
     private fun stopForegroundService() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {}
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -129,6 +168,15 @@ class PlayerRecordingService : Service() {
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {}
     }
 
     companion object {
